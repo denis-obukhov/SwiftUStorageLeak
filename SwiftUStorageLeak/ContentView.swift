@@ -11,36 +11,17 @@ import SwiftUI
 // 
 // Issue: Storing DetailsView context ( "isTakingSnapshot = true" ) leads to a memory leak
 //        All view associated memory storage doesn't get deallocated even though a view itself no longer exist
-// Conditions: NavigationView with StackNavigationViewStyle
-// Solution 1: use @FocusedValue and .focusedSceneValue() to control Commands
-// Solution 2: move stored context to ViewModel and capture it as a weak reference
+// Solution: move stored context to ViewModel and capture it as a weak reference
 
 // MARK: - App
 
 @main
 struct SwiftUStorageLeakApp: App {
-    @State var appCommands: [AppCommandItemType: AppCommandItem] = [:]
-    
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .onPreferenceChange(AppCommandItemKey.self) { preference in
-                    AppCommandItemType.allCases.forEach { commandType in
-                        let lastAction = preference.last(where: {
-                            $0.type == commandType
-                        })
-                        appCommands[commandType] = lastAction
-                    }
-                }
         }
-        .commands {
-            CommandMenu("Actions") {
-                Button("Take a snapshot") {
-                    appCommands[.takeSnapshot]?.action?()
-                }
-                .keyboardShortcut("D", modifiers: .command)
-            }
-        }
+        .commands(content: AppCommands.init)
     }
 }
 
@@ -51,11 +32,11 @@ struct ContentView: View {
         NavigationView {
             VStack {
                 ForEach(0..<5, id: \.self) { item in
-                    NavigationLink {
+                    NavigationLink("Go to details #\(item)") {
                         DetailsView(item: item)
-                    } label: {
-                        Text("Go to details #\(item)")
                     }
+                    .buttonStyle(.borderedProminent)
+                    .font(.largeTitle)
                 }
             }
         }
@@ -64,8 +45,9 @@ struct ContentView: View {
 }
 
 final class DetailsViewModel: ObservableObject {
-    init() { print("☀️ init") }
-    deinit { print("💭 deinit") }
+//    @Published var isTakingSnapshot = false // ✅ SOLUTION
+    init() { print("☀️ DetailViewModel init") }
+    deinit { print("💭 DetailViewModel deinit") }
 }
 
 struct DetailsView: View {
@@ -75,46 +57,123 @@ struct DetailsView: View {
     
     var body: some View {
         Text("Details #\(item)")
+            .font(.largeTitle)
+//          ⛔️ WRONG ATTEMPT:
             .sheet(isPresented: $isTakingSnapshot) {
                 Text("Snapshot #\(item)")
             }
-            .appCommand(.takeSnapshot, id: String(item)) {
+            .appCommand(.takeSnapshot) {
                 isTakingSnapshot = true // ⚠️ Capturing and saving DetailsView's context produces a memory leak
                 // DetailsView is a struct and there's no way to capture it as a weak reference
                 // A solution could be moving isTakingSnapshot var to view model as @Published property
                 // and capturing DetailsViewModel by a weak reference
             }
+        
+//            ✅ SOLUTION:
+//            .appCommand(.takeSnapshot) { [weak viewModel] in
+//                viewModel?.isTakingSnapshot = true
+//            }
+//            .sheet(isPresented: $viewModel.isTakingSnapshot) {
+//                Text("Snapshot #\(item)")
+//            }
     }
 }
 
-// MARK: - Preferences
+// MARK: - Commands
 
-enum AppCommandItemType: Equatable, CaseIterable, Hashable {
+enum AppCommandItemType: CaseIterable {
     case takeSnapshot, previous, next
 }
 
-struct AppCommandItem: Identifiable, Equatable {
+struct AppCommandItem {
     let type: AppCommandItemType
-    var action: (() -> Void)? = nil
-    let id: String // Provide an ID in order to make onPreferenceChange method get called
-    
-    static func == (lhs: AppCommandItem, rhs: AppCommandItem) -> Bool {
-        lhs.type == rhs.type && lhs.id == rhs.id
+    var action: () -> Void
+    var isActive = true
+}
+
+extension AppCommandItemType {
+    var focusedValueKeyPath: WritableKeyPath<FocusedValues, AppCommandItem?> {
+        switch self {
+        case .takeSnapshot:
+            return \.takeSnapshotCommand
+        case .previous:
+            return \.previousCommand
+        case .next:
+            return \.nextCommand
+        }
     }
 }
 
-struct AppCommandItemKey: PreferenceKey {
-    typealias Value = [AppCommandItem]
-    static var defaultValue: Value = []
+struct TakeSnapshotCommandKey: FocusedValueKey {
+    typealias Value = AppCommandItem
+}
+
+struct NextCommandCommandKey: FocusedValueKey {
+    typealias Value = AppCommandItem
+}
+
+struct PreviousCommandCommandKey: FocusedValueKey {
+    typealias Value = AppCommandItem
+}
+
+extension FocusedValues {
+    var takeSnapshotCommand: AppCommandItem? {
+        get { self[TakeSnapshotCommandKey.self] }
+        set { self[TakeSnapshotCommandKey.self] = newValue }
+    }
+  
+    var previousCommand: AppCommandItem? {
+        get { self[PreviousCommandCommandKey.self] }
+        set { self[PreviousCommandCommandKey.self] = newValue }
+    }
     
-    static func reduce(value: inout Value, nextValue: () -> Value) {
-        value = value + nextValue()
+    var nextCommand: AppCommandItem? {
+        get { self[NextCommandCommandKey.self] }
+        set { self[NextCommandCommandKey.self] = newValue }
     }
 }
 
 // Convenient extension
 extension View {
-    func appCommand( _ type: AppCommandItemType, id: String, action: (() -> Void)?) -> some View {
-        preference(key: AppCommandItemKey.self, value: [AppCommandItem(type: type, action: action, id: id)])
+    func appCommand(
+        _ type: AppCommandItemType,
+        action: @escaping () -> Void,
+        isActive: Bool = true
+    ) -> some View {
+        focusedSceneValue(
+            type.focusedValueKeyPath,
+            AppCommandItem(
+                type: type,
+                action: action,
+                isActive: isActive
+            )
+        )
+    }
+}
+
+struct AppCommands: Commands {
+    @FocusedValue(\.previousCommand) var previousCommand
+    @FocusedValue(\.nextCommand) var nextCommand
+    @FocusedValue(\.takeSnapshotCommand) var takeSnapshotCommand
+    
+    var body: some Commands {
+        CommandMenu("Actions") {
+            commandButton("Next", command: nextCommand)
+                .keyboardShortcut(.rightArrow, modifiers: .command)
+            
+            commandButton("Previous", command: previousCommand)
+                .keyboardShortcut(.leftArrow, modifiers: .command)
+  
+            commandButton("Make a Snapshot", command: takeSnapshotCommand)
+                .keyboardShortcut("D", modifiers: .command)
+        }
+    }
+    
+    @ViewBuilder
+    private func commandButton(_ name: String, command: AppCommandItem?) -> some View {
+        if let command = command {
+            Button(name, action: command.action)
+                .disabled(command.isActive != true)
+        }
     }
 }
